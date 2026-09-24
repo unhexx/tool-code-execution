@@ -1,0 +1,29 @@
+[project]
+name = "tool-code-execution"
+version = "1.0.0"
+description = "Local restricted Python sandbox replacing xAI server-side code_execution"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Evgeniy Chistyakov", email = "unhandled@exception.expert" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9"]
+
+[project.scripts]
+tool-code-execution = "code_execution.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools]
+py-modules = ["tool_http"]
