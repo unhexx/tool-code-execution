@@ -42,3 +42,10 @@ your loop must `POST /v1/invoke`.
 - bearer `TOOL_TOKEN` (default `local` — change before any non-loopback bind)
 
 Copyright 2026 Evgeniy Chistyakov · https://exception.expert
+
+## Документы для агентов
+
+- [Дизайн](docs/DESIGN.md)
+- [Очередь задач](docs/AGENT_TASKS.md)
+- [AGENTS.md](AGENTS.md)
+
