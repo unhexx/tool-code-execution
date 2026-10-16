@@ -9,3 +9,21 @@ data/runtime/
 compose.env
 *.egg-info/
 .DS_Store
+
+# Agentix template and cycle artifacts — merge into project .gitignore
+agentic_loop_template/
+agentic_loop_template
+.agent/handoff_*.json
+.agent/last_handoff.json
+.agent/worktrees/
+PROJECT_CONTEXT.md
+SPRINTPLAN.md
+.env.agentic
+.env.blackbox
+blackbox_start_prompt.txt
+.agent/proxy_events.jsonl
+.agent/proxy_cache.sqlite
+.agent/proxy_cache.sqlite-*
+.agent/sft/
+.agent/stream_leases.json
+.agent/streams_state.json
