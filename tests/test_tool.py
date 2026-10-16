@@ -51,3 +51,14 @@ def test_server_survives_and_runs_in_child():
     out = run({"code": "print(1)"})
     assert out["ok"] is True
     assert os.getpid()  # parent process still alive after previous kills
+
+
+def test_one_gb_allocation_hits_limit():
+    out = run({"code": "b = bytearray(1024 * 1024 * 1024)", "timeout_sec": 3})
+    assert out["ok"] is False
+
+
+def test_env_is_scrubbed(monkeypatch):
+    monkeypatch.setenv("TOOL_TOKEN", "leak-me")
+    out = run({"code": "print('ok')"})
+    assert out["ok"] is True and "leak-me" not in out["stdout"]

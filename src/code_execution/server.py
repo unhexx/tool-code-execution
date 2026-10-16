@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ SCHEMA = {
 _CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_child.py")
 MAX_TIMEOUT_SEC = int(os.environ.get("CODE_EXEC_MAX_TIMEOUT", "10"))
 MEM_LIMIT_MB = int(os.environ.get("CODE_EXEC_MEM_MB", "256"))
+NPROC_LIMIT = int(os.environ.get("CODE_EXEC_NPROC", "64"))
 
 
 def _limits(cpu_sec: int) -> None:  # runs in the child before exec
@@ -39,7 +41,18 @@ def _limits(cpu_sec: int) -> None:  # runs in the child before exec
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
     resource.setrlimit(resource.RLIMIT_NOFILE, (16, 16))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_NPROC, (NPROC_LIMIT, NPROC_LIMIT))
     os.setsid()
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
 
 
 def run(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -54,29 +67,33 @@ def run(arguments: dict[str, Any]) -> dict[str, Any]:
         timeout = 5
     timeout = max(1, min(timeout, MAX_TIMEOUT_SEC))
     with tempfile.TemporaryDirectory(prefix="sbx-") as cwd:
+        proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-I", "-S", _CHILD],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            env={"PYTHONIOENCODING": "utf-8", "PATH": "/usr/bin:/bin"},
+            preexec_fn=lambda: _limits(timeout),  # noqa: PLW1509
+        )
         try:
-            proc = subprocess.run(  # noqa: S603
-                [sys.executable, "-I", "-S", _CHILD],
-                input=code,
-                capture_output=True,
-                text=True,
-                timeout=timeout + 1,
-                cwd=cwd,
-                env={"PYTHONIOENCODING": "utf-8", "PATH": "/usr/bin:/bin"},
-                preexec_fn=lambda: _limits(timeout),  # noqa: PLW1509
-            )
+            stdout, stderr = proc.communicate(code, timeout=timeout + 1)
         except subprocess.TimeoutExpired:
+            _kill_group(proc)
             return {"stdout": "", "stderr": "", "ok": False, "error": f"timeout after {timeout}s"}
+        finally:
+            _kill_group(proc)  # reap any stray descendants in the session
     if proc.returncode != 0:
         if proc.returncode in (-9, -24):  # SIGKILL / SIGXCPU
             err = f"resource limit exceeded (cpu {timeout}s / mem {MEM_LIMIT_MB}MB)"
         else:
             err = f"sandbox exited with code {proc.returncode}"
-        return {"stdout": "", "stderr": proc.stderr[-2000:], "ok": False, "error": err}
+        return {"stdout": "", "stderr": stderr[-2000:], "ok": False, "error": err}
     try:
-        return json.loads(proc.stdout)
+        return json.loads(stdout)
     except json.JSONDecodeError:
-        return {"stdout": "", "stderr": proc.stderr[-2000:], "ok": False, "error": "sandbox produced invalid output"}
+        return {"stdout": "", "stderr": stderr[-2000:], "ok": False, "error": "sandbox produced invalid output"}
 
 
 def main() -> None:
