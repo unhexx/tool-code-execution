@@ -1,25 +1,36 @@
 """Minimal JSON HTTP surface shared by local tools (stdlib only)."""
 from __future__ import annotations
 
+import hmac
 import json
 import os
+import sys
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 
+_INSECURE_TOKENS = {"", "local", "changeme"}
+
+
 def _token() -> str:
-    return os.environ.get("TOOL_TOKEN", "local")
+    return os.environ.get("TOOL_TOKEN", "")
+
+
+def require_token() -> None:
+    """Refuse to start with a missing or well-known token unless explicitly allowed for dev."""
+    if _token() in _INSECURE_TOKENS and os.environ.get("TOOL_ALLOW_INSECURE") != "1":
+        raise SystemExit("TOOL_TOKEN is unset or insecure; set a random token (or TOOL_ALLOW_INSECURE=1 for local dev)")
 
 
 def check_auth(header: str | None) -> None:
     expected = _token()
-    if not expected:
+    if not expected and os.environ.get("TOOL_ALLOW_INSECURE") == "1":
         return
     if not header or not header.startswith("Bearer "):
         raise PermissionError("missing bearer token")
-    if header.split(" ", 1)[1].strip() != expected:
+    if not expected or not hmac.compare_digest(header.split(" ", 1)[1].strip(), expected):
         raise PermissionError("invalid bearer token")
 
 
@@ -64,14 +75,18 @@ def make_handler(name: str, schema: dict[str, Any], invoke: Callable[[dict[str, 
                 result = invoke(arguments)
                 self._send(200, {"ok": True, "tool": name, "result": result})
             except PermissionError as exc:
-                self._send(401, {"ok": False, "error": str(exc)})
-            except Exception as exc:  # noqa: BLE001
-                self._send(400, {"ok": False, "error": str(exc), "trace": traceback.format_exc()[-1500:]})
+                self._send(401, {"ok": False, "error": {"type": "unauthorized", "message": str(exc)}})
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send(400, {"ok": False, "error": {"type": "bad_request", "message": str(exc)}})
+            except Exception:  # noqa: BLE001
+                print(traceback.format_exc(), file=sys.stderr, flush=True)  # trace stays server-side
+                self._send(500, {"ok": False, "error": {"type": "internal", "message": "internal tool error"}})
 
     return Handler
 
 
 def serve(name: str, schema: dict[str, Any], invoke: Callable[[dict[str, Any]], Any]) -> None:
+    require_token()
     host = os.environ.get("TOOL_HOST", "127.0.0.1")
     port = int(os.environ.get("TOOL_PORT", "8090"))
     httpd = ThreadingHTTPServer((host, port), make_handler(name, schema, invoke))

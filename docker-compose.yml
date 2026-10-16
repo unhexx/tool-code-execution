@@ -9,7 +9,7 @@ services:
     environment:
       TOOL_HOST: "0.0.0.0"
       TOOL_PORT: "8091"
-      TOOL_TOKEN: "${TOOL_TOKEN:-local}"
+      TOOL_TOKEN: "${TOOL_TOKEN:?set TOOL_TOKEN}"
       TOOL_OFFLINE: "1"
 
     volumes:

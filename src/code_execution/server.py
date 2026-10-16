@@ -1,12 +1,11 @@
-"""Local code_execution drop-in: restricted Python eval, no network, no FS writes."""
+"""Local code_execution drop-in: Python in a separate rlimited process (CPU, memory, no file writes); run the container with network disabled."""
 from __future__ import annotations
 
-import ast
-import io
+import json
 import os
+import subprocess
 import sys
-import traceback
-from contextlib import redirect_stderr, redirect_stdout
+import tempfile
 from typing import Any
 
 from tool_http import serve
@@ -20,47 +19,27 @@ SCHEMA = {
         "type": "object",
         "properties": {
             "code": {"type": "string", "description": "Python 3 source to execute"},
-            "timeout_sec": {"type": "integer", "description": "Soft timeout hint (seconds)", "default": 5},
+            "timeout_sec": {"type": "integer", "description": "Hard wall/CPU timeout in seconds (1..10)", "default": 5},
         },
         "required": ["code"],
     },
 }
 
-_FORBIDDEN = {
-    "os", "sys", "subprocess", "socket", "shutil", "pathlib", "ctypes",
-    "multiprocessing", "threading", "signal", "importlib", "builtins",
-    "posix", "nt", "fcntl", "pty", "resource", "http", "urllib", "requests",
-    "webbrowser", "tempfile", "pickle", "marshal", "code", "codeop",
-}
-
-_ALLOWED_IMPORT_ROOTS = {
-    "math", "statistics", "json", "re", "datetime", "collections",
-    "itertools", "functools", "decimal", "fractions", "string",
-    "textwrap", "unicodedata", "hashlib", "base64", "csv", "io",
-    "copy", "operator", "typing", "dataclasses", "enum", "numbers",
-}
+_CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_child.py")
+MAX_TIMEOUT_SEC = int(os.environ.get("CODE_EXEC_MAX_TIMEOUT", "10"))
+MEM_LIMIT_MB = int(os.environ.get("CODE_EXEC_MEM_MB", "256"))
 
 
-class _Guard(ast.NodeVisitor):
-    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
-        for alias in node.names:
-            root = alias.name.split(".", 1)[0]
-            if root in _FORBIDDEN or root not in _ALLOWED_IMPORT_ROOTS:
-                raise ValueError(f"import blocked: {alias.name}")
+def _limits(cpu_sec: int) -> None:  # runs in the child before exec
+    import resource
 
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
-        root = (node.module or "").split(".", 1)[0]
-        if root in _FORBIDDEN or root not in _ALLOWED_IMPORT_ROOTS:
-            raise ValueError(f"import blocked: {node.module}")
-
-    def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802
-        if isinstance(node.attr, str) and node.attr.startswith("__"):
-            raise ValueError("dunder attribute access blocked")
-        self.generic_visit(node)
-
-    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
-        if node.id in {"__import__", "eval", "exec", "compile", "open", "input", "breakpoint"}:
-            raise ValueError(f"name blocked: {node.id}")
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu_sec, cpu_sec))
+    mem = MEM_LIMIT_MB * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (16, 16))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    os.setsid()
 
 
 def run(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -69,36 +48,35 @@ def run(arguments: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("code is required")
     if len(code) > 40_000:
         raise ValueError("code too large")
-    tree = ast.parse(code, mode="exec")
     try:
-        _Guard().visit(tree)
-    except ValueError as exc:
-        return {"stdout": "", "stderr": str(exc), "ok": False, "error": str(exc)}
-    compiled = compile(tree, "<sandbox>", "exec")
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    glb: dict[str, Any] = {"__builtins__": {
-        "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
-        "enumerate": enumerate, "float": float, "int": int, "len": len,
-        "list": list, "max": max, "min": min, "pow": pow, "print": print,
-        "range": range, "repr": repr, "round": round, "set": set,
-        "sorted": sorted, "str": str, "sum": sum, "tuple": tuple, "zip": zip,
-    }}
+        timeout = int(arguments.get("timeout_sec", 5))
+    except (TypeError, ValueError):
+        timeout = 5
+    timeout = max(1, min(timeout, MAX_TIMEOUT_SEC))
+    with tempfile.TemporaryDirectory(prefix="sbx-") as cwd:
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [sys.executable, "-I", "-S", _CHILD],
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=timeout + 1,
+                cwd=cwd,
+                env={"PYTHONIOENCODING": "utf-8", "PATH": "/usr/bin:/bin"},
+                preexec_fn=lambda: _limits(timeout),  # noqa: PLW1509
+            )
+        except subprocess.TimeoutExpired:
+            return {"stdout": "", "stderr": "", "ok": False, "error": f"timeout after {timeout}s"}
+    if proc.returncode != 0:
+        if proc.returncode in (-9, -24):  # SIGKILL / SIGXCPU
+            err = f"resource limit exceeded (cpu {timeout}s / mem {MEM_LIMIT_MB}MB)"
+        else:
+            err = f"sandbox exited with code {proc.returncode}"
+        return {"stdout": "", "stderr": proc.stderr[-2000:], "ok": False, "error": err}
     try:
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            exec(compiled, glb, glb)  # noqa: S102
-        return {
-            "stdout": stdout.getvalue()[-8000:],
-            "stderr": stderr.getvalue()[-2000:],
-            "ok": True,
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "stdout": stdout.getvalue()[-2000:],
-            "stderr": (stderr.getvalue() + traceback.format_exc())[-4000:],
-            "ok": False,
-            "error": str(exc),
-        }
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"stdout": "", "stderr": proc.stderr[-2000:], "ok": False, "error": "sandbox produced invalid output"}
 
 
 def main() -> None:
